@@ -14,13 +14,15 @@ Python computes every trajectory ONCE via simulate(); the browser just replays.
 """
 
 import json
+import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 import streamlit.components.v1 as components
 
-from three_body import simulate, separation, estimate_lyapunov
+from three_body import (simulate, separation, estimate_lyapunov,
+                        energy_series, momentum_series, angular_momentum_series)
 
 st.set_page_config(page_title="Three-Body Simulator", layout="wide")
 st.title("Three-Body Gravity Simulator")
@@ -271,24 +273,43 @@ def drift_pct(e):
 # --- Run ---------------------------------------------------------------------
 if st.button("Run simulation", type="primary"):
     with st.spinner("Integrating (RK4, Euler, and a perturbed twin)..."):
-        traj_rk4, e_rk4 = simulate(masses, positions, velocities, dt, int(steps), eps, "rk4")
-        traj_eul, e_eul = simulate(masses, positions, velocities, dt, int(steps), eps, "euler")
+        t0 = time.perf_counter()
+        pos_rk4, vel_rk4 = simulate(masses, positions, velocities, dt, int(steps), eps, "rk4")
+        time_rk4 = time.perf_counter() - t0
 
-        pos_pert = [list(row) for row in positions]
-        pos_pert[0][0] += pert                       # nudge body 1's x by `pert`
-        traj_pert, _ = simulate(masses, pos_pert, velocities, dt, int(steps), eps, "rk4")
+        t0 = time.perf_counter()
+        pos_eul, vel_eul = simulate(masses, positions, velocities, dt, int(steps), eps, "euler")
+        time_eul = time.perf_counter() - t0
 
-    d_rk4, d_eul = drift_pct(e_rk4), drift_pct(e_eul)
-    sep = separation(traj_rk4, traj_pert)
+        pos_p = [list(row) for row in positions]
+        pos_p[0][0] += pert                          # nudge body 1's x by `pert`
+        pos_pert, _ = simulate(masses, pos_p, velocities, dt, int(steps), eps, "rk4")
+
+    # conserved quantities for the primary (RK4) run
+    E = energy_series(pos_rk4, vel_rk4, masses, eps)
+    P = momentum_series(vel_rk4, masses)             # (steps, 2)
+    L = angular_momentum_series(pos_rk4, vel_rk4, masses)
+    # ...and for Euler, for the head-to-head
+    E_e = energy_series(pos_eul, vel_eul, masses, eps)
+    P_e = momentum_series(vel_eul, masses)
+
+    # chaos
+    sep = separation(pos_rk4, pos_pert)
     lam = estimate_lyapunov(sep, dt)
     horizon = np.argmax(sep > 1.0)
     t_horizon = horizon * dt if horizon > 0 else None
 
-    tabs = st.tabs(["Animation", "Trajectory", "Energy", "Euler vs RK4", "Chaos"])
+    ii = _idx(E, 2000)                               # shared chart downsample index
+
+    def _relerr(series):
+        a, b = series[0], series[-1]
+        return abs((b - a) / a) if a != 0 else float("nan")
+
+    tabs = st.tabs(["Animation", "Trajectory", "Conservation", "Euler vs RK4", "Chaos"])
 
     # 1) Animation
     with tabs[0]:
-        components.html(build_anim_html(traj_rk4, masses), height=620)
+        components.html(build_anim_html(pos_rk4, masses), height=620)
         st.caption("The RK4 solution in motion. Bright dot = a body now; "
                    "the fading comet is where it just came from.")
 
@@ -296,73 +317,99 @@ if st.button("Run simulation", type="primary"):
     with tabs[1]:
         fig, ax = plt.subplots(figsize=(6, 6))
         for i in range(3):
-            ax.plot(traj_rk4[:, i, 0], traj_rk4[:, i, 1], color=STATIC_COLORS[i],
+            ax.plot(pos_rk4[:, i, 0], pos_rk4[:, i, 1], color=STATIC_COLORS[i],
                     lw=0.8, label=f"Body {i + 1}")
-            ax.plot(traj_rk4[0, i, 0], traj_rk4[0, i, 1], "o", color=STATIC_COLORS[i])
+            ax.plot(pos_rk4[0, i, 0], pos_rk4[0, i, 1], "o", color=STATIC_COLORS[i])
         ax.set_aspect("equal"); ax.legend(); ax.set_xlabel("x"); ax.set_ylabel("y")
         ax.set_title("Full RK4 trajectories")
         st.pyplot(fig)
 
-    # 3) Energy
+    # 3) Conservation
     with tabs[2]:
-        st.metric("RK4 energy drift", f"{d_rk4:.4f}%",
-                  help="Change in total energy over the run. Real physics keeps it "
-                       "at zero, so a tiny number means an accurate integration.")
-        st.markdown("**Total energy over time (RK4)**")
-        st.line_chart(e_rk4)
-        st.caption("A flat line is proof the simulation is physically honest. "
-                   "(The Pythagorean preset is a hard, close-encounter case, so it "
-                   "drifts a little more than the gentle presets.)")
+        st.markdown("**Energy vs time**")
+        st.line_chart(E[ii])
+        st.markdown("**Linear momentum vs time (x and y components)**")
+        st.line_chart(pd.DataFrame({"px": P[ii, 0], "py": P[ii, 1]}))
+        st.markdown("**Angular momentum vs time**")
+        st.line_chart(L[ii])
+
+        P0, Pf = np.linalg.norm(P[0]), np.linalg.norm(P[-1])
+        p_drift = np.linalg.norm(P[-1] - P[0])
+        p_rel = f"{p_drift / P0:.2e}" if P0 > 1e-9 else f"{p_drift:.2e} (abs)"
+        diag = pd.DataFrame(
+            [["Energy",            f"{E[0]:.5g}", f"{E[-1]:.5g}", f"{_relerr(E):.2e}"],
+             ["|Linear momentum|", f"{P0:.3g}",   f"{Pf:.3g}",    p_rel],
+             ["Angular momentum",  f"{L[0]:.5g}", f"{L[-1]:.5g}", f"{_relerr(L):.2e}"]],
+            columns=["Quantity", "Initial", "Final", "Relative error"]).set_index("Quantity")
+        st.markdown("**Conservation diagnostics**")
+        st.table(diag)
+        st.caption("Real physics holds all three constant. Linear momentum is conserved to "
+                   "machine precision by construction (the pairwise forces cancel); energy and "
+                   "angular momentum reveal how good the integrator is. The Pythagorean preset "
+                   "is a hard, close-encounter case and drifts more than the gentle ones.")
 
     # 4) Euler vs RK4
     with tabs[3]:
         st.markdown("**Same initial conditions, two integrators.** "
                     "Watch Euler wander off the true path while RK4 holds it.")
         components.html(build_twin_html(
-            traj_eul, traj_rk4, masses, framing_bounds(traj_rk4),
+            pos_eul, pos_rk4, masses, framing_bounds(pos_rk4),
             "Euler", "RK4", "drifts", "holds", "tag", "tag good"), height=520)
-        c1, c2 = st.columns(2)
-        c1.metric("Euler energy drift", f"{d_eul:.3f}%")
-        c2.metric("RK4 energy drift", f"{d_rk4:.4f}%")
-        st.markdown("**Total energy over time — both methods on one axis**")
-        st.line_chart(pd.DataFrame({"Euler": e_eul, "RK4": e_rk4}))
-        st.caption("Same physics, same inputs — the only difference is the integrator.")
+
+        traj_diff = separation(pos_eul, pos_rk4)[-1]
+        pdrift_e = np.linalg.norm(P_e[-1] - P_e[0])
+        pdrift_r = np.linalg.norm(P[-1] - P[0])
+        table = pd.DataFrame({
+            "Metric": ["Timestep (dt)", "Steps", "Compute time (s)",
+                       "Energy error (%)", "Momentum drift",
+                       "Trajectory diff vs RK4 (final)"],
+            "Euler": [f"{dt:g}", f"{int(steps)}", f"{time_eul:.3f}",
+                      f"{_relerr(E_e) * 100:.3f}", f"{pdrift_e:.1e}", f"{traj_diff:.3f}"],
+            "RK4": [f"{dt:g}", f"{int(steps)}", f"{time_rk4:.3f}",
+                    f"{_relerr(E) * 100:.4f}", f"{pdrift_r:.1e}", "0 (reference)"],
+        }).set_index("Metric")
+        st.markdown("**Euler vs RK4 - head to head**")
+        st.table(table)
+        st.markdown("**Total energy over time - both methods on one axis**")
+        st.line_chart(pd.DataFrame({"Euler": E_e[ii], "RK4": E[ii]}))
+        st.caption("Both methods conserve momentum exactly, so energy error and the trajectory "
+                   "difference are what set them apart - RK4 for a little more compute per step.")
 
     # 5) Chaos
     with tabs[4]:
         st.markdown(
             f"**Two RK4 runs of the *same* system.** The only difference: the "
-            f"'Perturbed' run started with body 1 nudged by **{pert:g}** in x — "
-            f"about one part in {int(1/pert):,} of the system size. They track "
+            f"'Perturbed' run started with body 1 nudged by **{pert:g}** in x - "
+            f"about one part in {int(1 / pert):,} of the system size. They track "
             f"together, then split into completely different futures.")
         components.html(build_twin_html(
-            traj_rk4, traj_pert, masses, framing_bounds(traj_rk4, traj_pert),
+            pos_rk4, pos_pert, masses, framing_bounds(pos_rk4, pos_pert),
             "Original", "Perturbed", "start x\u2080", f"x\u2080 + {pert:g}",
             "tag neutral", "tag neutral"), height=520)
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Perturbation", f"{pert:g}")
         m2.metric("Lyapunov estimate",
-                  f"{lam:.3f}/time" if lam is not None else "—",
+                  f"{lam:.3f}/time" if lam is not None else "-",
                   help="Slope of ln(separation) vs time in the growth region. "
                        "Positive = exponential divergence = chaos.")
         m3.metric("Predictability horizon",
-                  f"t \u2248 {t_horizon:.1f}" if t_horizon else "—",
-                  help="When the tiny difference has grown to order 1 — beyond "
+                  f"t \u2248 {t_horizon:.1f}" if t_horizon else "-",
+                  help="When the tiny difference has grown to order 1 - beyond "
                        "this, prediction is effectively impossible.")
 
         st.markdown("**Separation between the two systems over time (log scale)**")
-        si = _idx(sep.reshape(-1, 1, 1), 2000)
-        t = si * dt
+        si = _idx(sep, 2000)
+        tt = si * dt
         fig2, ax2 = plt.subplots(figsize=(7, 4))
-        ax2.semilogy(t, np.maximum(sep[si], 1e-12), color="#3B7DD8", lw=1.3)
+        ax2.semilogy(tt, np.maximum(sep[si], 1e-12), color="#3B7DD8", lw=1.3)
         ax2.axhline(pert, ls="--", color="#999", lw=1, label="initial difference")
         ax2.axhline(1.0, ls=":", color="#C0563A", lw=1, label="order-1 (macroscopic)")
         ax2.set_xlabel("time"); ax2.set_ylabel("separation (log scale)")
         ax2.set_title("Sensitive dependence on initial conditions")
         ax2.legend(loc="lower right", fontsize=8)
         st.pyplot(fig2)
-        st.caption("A straight line on this log axis means the gap grows exponentially — "
+        st.caption("A straight line on this log axis means the gap grows exponentially - "
                    "the signature of chaos. Try this on the Pythagorean preset for the full "
                    "effect; on the stable Figure-8 the line stays almost flat, because that "
                    "orbit resists perturbation. That contrast is itself a real result.")
