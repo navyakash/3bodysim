@@ -22,7 +22,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from three_body import (simulate, separation, estimate_lyapunov,
-                        energy_series, momentum_series, angular_momentum_series)
+                        energy_series, momentum_series, angular_momentum_series,
+                        detect_events, potential_grid)
+from survey import run_stability_map
 
 st.set_page_config(page_title="Three-Body Simulator", layout="wide")
 st.title("Three-Body Gravity Simulator")
@@ -305,7 +307,8 @@ if st.button("Run simulation", type="primary"):
         a, b = series[0], series[-1]
         return abs((b - a) / a) if a != 0 else float("nan")
 
-    tabs = st.tabs(["Animation", "Trajectory", "Conservation", "Euler vs RK4", "Chaos"])
+    tabs = st.tabs(["Animation", "Trajectory", "Conservation", "Euler vs RK4",
+                    "Chaos", "Events", "Field"])
 
     # 1) Animation
     with tabs[0]:
@@ -413,5 +416,133 @@ if st.button("Run simulation", type="primary"):
                    "the signature of chaos. Try this on the Pythagorean preset for the full "
                    "effect; on the stable Figure-8 the line stays almost flat, because that "
                    "orbit resists perturbation. That contrast is itself a real result.")
+
+    # 6) Events
+    with tabs[5]:
+        ev = detect_events(pos_rk4, vel_rk4, masses, dt, eps)
+
+        def _yn(b):
+            return "detected" if b else "-"
+
+        def _pair(p):
+            return f"bodies {p[0] + 1} & {p[1] + 1}" if p else "-"
+
+        rows = [
+            ["Collision / close encounter", _yn(ev["collision"]),
+             (f"{_pair(ev['collision_pair'])} at t={ev['collision_time']:.1f}, "
+              f"min gap {ev['min_pair_distance']:.3f}") if ev["collision"]
+             else f"closest approach was {ev['min_pair_distance']:.3f}"],
+            ["Escape / ejection", _yn(ev["escape"]),
+             (f"body {ev['escape_body'] + 1} at t={ev['escape_time']:.1f}, reached "
+              f"{ev['max_com_distance']:.1f} from centre") if ev["escape"]
+             else f"max distance from centre was {ev['max_com_distance']:.1f}"],
+            ["Gravitational slingshot", _yn(ev["slingshot"]),
+             f"body {ev['slingshot_body'] + 1} sped up sharply after the encounter"
+             if ev["slingshot"] else "no strong post-encounter speed-up"],
+            ["Capture (binary forms)", _yn(ev["capture"]),
+             f"bodies {ev['capture_pair'][0] + 1} & {ev['capture_pair'][1] + 1} left bound"
+             if ev["capture"] else "no bound pair left at the end"],
+        ]
+        st.markdown("**Event detection**")
+        st.table(pd.DataFrame(rows, columns=["Event", "Status", "Details"]).set_index("Event"))
+        st.caption("Heuristic detectors with tunable thresholds (collision radius, escape "
+                   "radius, slingshot gain). Try the Pythagorean preset: it ejects the "
+                   "lightest body while the other two capture into a binary.")
+
+    # 7) Field
+    with tabs[6]:
+        p0 = np.asarray(positions, float)
+        cx, cy = p0[:, 0].mean(), p0[:, 1].mean()
+        span = max(np.ptp(p0[:, 0]), np.ptp(p0[:, 1]), 1.0) * 0.5 + 2.0
+        X, Y, Phi = potential_grid(masses, positions,
+                                   (cx - span, cx + span), (cy - span, cy + span),
+                                   240, max(eps, 0.05))
+        Phi_c = np.clip(Phi, np.percentile(Phi, 3), np.percentile(Phi, 97))
+        fig3, ax3 = plt.subplots(figsize=(6.5, 6))
+        cf = ax3.contourf(X, Y, Phi_c, levels=30, cmap="magma")
+        ax3.contour(X, Y, Phi_c, levels=14, colors="white", linewidths=0.3, alpha=0.35)
+        for i in range(3):
+            ax3.plot(pos_rk4[:, i, 0], pos_rk4[:, i, 1], color="white", lw=0.5, alpha=0.5)
+        ax3.scatter(p0[:, 0], p0[:, 1], c="#7DF9FF",
+                    s=[25 + 25 * mm for mm in masses], edgecolor="k", zorder=5)
+        ax3.set_xlim(cx - span, cx + span)
+        ax3.set_ylim(cy - span, cy + span)
+        ax3.set_aspect("equal")
+        ax3.set_title("Gravitational potential  \u03a6(x, y)")
+        fig3.colorbar(cf, ax=ax3, label="potential (deeper = stronger pull)")
+        st.pyplot(fig3)
+        st.caption("Filled contours of the gravitational potential for the starting "
+                   "configuration - the deep wells are the bodies. The faint white lines are "
+                   "the actual trajectories, which flow through the shape of this landscape.")
 else:
     st.info("Set your values on the left and above, then click **Run simulation**.")
+
+
+# --- Monte Carlo stability map (independent of the single run above) ----------
+st.divider()
+st.header("Monte Carlo stability map")
+st.markdown(
+    "Scan a whole family of three-body systems at once. A heavy central body sits at "
+    "the origin with a distant perturber; a test body is launched from a range of "
+    "**positions** (Y axis) and **speeds** (X axis). Every point is one simulation "
+    "(plus a perturbed twin to test for chaos), classified by its fate.")
+
+cA, cB = st.columns(2)
+res = cA.slider("Grid resolution (N x N simulations)", 20, 36, 30)
+mc_steps = cB.slider("Steps per simulation", 1500, 4000, 2500, step=500)
+
+
+@st.cache_data(show_spinner=False)
+def _stability(N, steps):
+    masses = [3.0, 1.0, 1.0]
+    base_pos = [[0.0, 0.0], [1.5, 0.0], [5.0, 0.0]]
+    base_vel = [[0.0, 0.0], [0.0, 1.0], [0.0, 0.6]]
+    pa = np.linspace(1.0, 3.0, N)          # Y axis: launch position (x)
+    va = np.linspace(0.5, 3.0, N)          # X axis: launch speed (vy)
+    return run_stability_map(masses, base_pos, base_vel, 1, pa, va,
+                             dt=0.004, steps=steps, eps=0.02)
+
+
+if st.button("Generate stability map", type="primary"):
+    with st.spinner(f"Running {res * res} simulations (plus perturbed twins)..."):
+        map_df, grid, ya, xa = _stability(res, int(mc_steps))
+
+    CLASSES = ["periodic", "chaotic", "collision", "escape"]
+    CLASS_COLORS = {"periodic": "#2E8B57", "chaotic": "#E8A317",
+                    "collision": "#C0392B", "escape": "#2E6FB0"}
+    code = {c: i for i, c in enumerate(CLASSES)}
+    Z = np.vectorize(lambda c: code[c])(grid)
+
+    from matplotlib.colors import ListedColormap
+    from matplotlib.patches import Patch
+    cmap = ListedColormap([CLASS_COLORS[c] for c in CLASSES])
+
+    left, right = st.columns([3, 2])
+    with left:
+        figm, axm = plt.subplots(figsize=(6.5, 6))
+        axm.imshow(Z, origin="lower", aspect="auto",
+                   extent=[xa[0], xa[-1], ya[0], ya[-1]],
+                   cmap=cmap, vmin=0, vmax=len(CLASSES) - 1)
+        axm.set_xlabel("initial velocity  (vy of the test body)")
+        axm.set_ylabel("initial position  (x of the test body)")
+        axm.set_title("Stability map")
+        axm.legend(handles=[Patch(color=CLASS_COLORS[c], label=c) for c in CLASSES],
+                   loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=9, frameon=False)
+        figm.tight_layout()
+        st.pyplot(figm)
+    with right:
+        st.markdown("**Outcome counts**")
+        counts = (map_df["class"].value_counts()
+                  .rename_axis("class").reset_index(name="count").set_index("class"))
+        st.table(counts)
+        st.metric("Stable (bounded) fraction", f"{100 * map_df['stable'].mean():.1f}%")
+
+    st.markdown("**Generated dataset** (one row per simulation)")
+    st.dataframe(map_df, height=260)
+    st.download_button("Download dataset (CSV)", map_df.to_csv(index=False),
+                       "stability_dataset.csv", "text/csv")
+    st.caption("A real labelled dataset: initial conditions in, outcome and diagnostics out. "
+               "Exactly the kind of thing you could train a classifier on to predict a "
+               "system's fate from its starting state - physics generating machine-learning data.")
+else:
+    st.info("Choose a resolution and click **Generate stability map**.")

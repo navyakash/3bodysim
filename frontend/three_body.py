@@ -125,3 +125,91 @@ def estimate_lyapunov(d, dt):
         return None
     idx = np.where(mask)[0]
     return float(np.polyfit(idx * dt, np.log(d[idx]), 1)[0])
+
+
+# ---- Event detection (analysis of a single completed run) -------------------
+def detect_events(pos_traj, vel_traj, masses, dt, eps=1e-3,
+                  r_collide=0.15, r_escape=None, slingshot_gain=1.4):
+    """Classify what physically happened during one run. Heuristic but tunable.
+
+    Returns a dict describing collision, escape, slingshot and capture.
+    """
+    m = np.asarray(masses, float)
+    n = len(m); M = m.sum()
+    T = pos_traj.shape[0]
+    if r_escape is None:
+        r_escape = 8.0 * np.sqrt(np.mean(np.sum((pos_traj[0] - pos_traj[0].mean(0))**2, axis=1)) + 1e-9)
+        r_escape = max(r_escape, 8.0)
+
+    # pairwise distances over time
+    diff = pos_traj[:, :, None, :] - pos_traj[:, None, :, :]      # (T,n,n,2)
+    dist = np.sqrt(np.sum(diff**2, axis=3) + eps**2)             # (T,n,n)
+    iu = np.triu_indices(n, 1)
+    pair_d = dist[:, iu[0], iu[1]]                               # (T, pairs)
+
+    min_pair = pair_d.min()
+    k_min = np.unravel_index(pair_d.argmin(), pair_d.shape)      # (time, pair)
+    pair_ij = (iu[0][k_min[1]], iu[1][k_min[1]])
+
+    collision = bool(min_pair < r_collide)
+
+    # distance from centre of mass
+    com = (m[None, :, None] * pos_traj).sum(axis=1) / M          # (T,2)
+    rcom = np.sqrt(((pos_traj - com[:, None, :])**2).sum(axis=2))  # (T,n)
+    max_com_body = rcom.max(axis=0)
+    escaper = int(max_com_body.argmax())
+    escape = bool(max_com_body[escaper] > r_escape)
+    escape_time = float(np.argmax(rcom[:, escaper] > r_escape) * dt) if escape else None
+
+    # slingshot: a body's speed jumps across the closest encounter
+    speed = np.sqrt(np.sum(vel_traj**2, axis=2))                 # (T,n)
+    t_enc = k_min[0]
+    slingshot = False; sling_body = None
+    if 0 < t_enc < T - 1:
+        w = max(1, T // 50)
+        before = speed[max(0, t_enc - w):t_enc].mean(axis=0)
+        after = speed[t_enc:min(T, t_enc + w)].mean(axis=0)
+        gains = after / np.maximum(before, 1e-9)
+        if gains.max() > slingshot_gain:
+            slingshot = True; sling_body = int(gains.argmax())
+
+    # capture: at the end, two bodies form a tight bound pair while a third is far
+    end_pair = dist[-1][iu[0], iu[1]]
+    tight = end_pair.argmin()
+    i, j = iu[0][tight], iu[1][tight]
+    third = [b for b in range(n) if b not in (i, j)]
+    capture = False; cap_pair = None
+    if n == 3 and rcom[-1, third[0]] > r_escape * 0.5:
+        rel_v = np.sum((vel_traj[-1, i] - vel_traj[-1, j])**2)
+        rel_r = np.sqrt(np.sum((pos_traj[-1, i] - pos_traj[-1, j])**2) + eps**2)
+        mu = m[i] * m[j] / (m[i] + m[j])
+        two_body_E = 0.5 * mu * rel_v - G * m[i] * m[j] / rel_r
+        if two_body_E < 0 and end_pair[tight] < r_escape * 0.5:
+            capture = True; cap_pair = (int(i), int(j))
+
+    return {
+        "collision": collision, "collision_pair": pair_ij if collision else None,
+        "collision_time": float(k_min[0] * dt) if collision else None,
+        "min_pair_distance": float(min_pair),
+        "escape": escape, "escape_body": escaper if escape else None,
+        "escape_time": escape_time, "max_com_distance": float(max_com_body[escaper]),
+        "slingshot": slingshot, "slingshot_body": sling_body,
+        "capture": capture, "capture_pair": cap_pair,
+    }
+
+
+# ---- Gravitational field ----------------------------------------------------
+def potential_grid(masses, positions, xlim, ylim, res=220, eps=0.05):
+    """Gravitational potential Phi(x, y) = -sum_i G m_i / |r - r_i| on a grid.
+
+    Returns (X, Y, Phi) suitable for a contour / heat map.
+    """
+    m = np.asarray(masses, float)
+    pos = np.asarray(positions, float)
+    xs = np.linspace(xlim[0], xlim[1], res)
+    ys = np.linspace(ylim[0], ylim[1], res)
+    X, Y = np.meshgrid(xs, ys)
+    Phi = np.zeros_like(X)
+    for mi, (px, py) in zip(m, pos):
+        Phi -= G * mi / np.sqrt((X - px)**2 + (Y - py)**2 + eps**2)
+    return X, Y, Phi
