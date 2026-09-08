@@ -1,14 +1,18 @@
 """
-Batched survey engine for the stability map.
+Batched survey engine.
 
 All simulations (and a perturbed twin of each) are stepped forward together as
-one big (N, n_bodies, 2) array, so a full 1,000-run scan takes seconds. Each run
-is reduced on the fly to a few numbers and then classified:
+one big (N, n_bodies, 2) array, so scans of hundreds-to-thousands of runs take
+seconds. Each run is reduced to a few numbers and classified:
 
   collision : two bodies came within r_collide
   escape    : a body reached r_escape from the centre of mass
   chaotic   : bounded, but a 1e-6 twin diverged strongly (sensitive)
   periodic  : bounded, and its twin stayed close (regular / stable orbit)
+
+It also exposes initial_features(): quantities known at t=0 (energy, angular
+momentum, ...) used as inputs to the fate-prediction model. Those are computed
+WITHOUT running a simulation - that separation is what makes the ML honest.
 """
 
 import numpy as np
@@ -18,9 +22,23 @@ from three_body import G
 
 PERT = 1e-6   # size of the twin perturbation used to test for chaos
 
+# One shared scenario so the stability map and the ML model describe the same
+# family of systems: a heavy central body, a distant perturber, and a test body
+# launched from a range of positions (x) and speeds (vy).
+DEFAULT_SCENARIO = dict(
+    masses=[3.0, 1.0, 1.0],
+    base_pos=[[0.0, 0.0], [1.5, 0.0], [5.0, 0.0]],
+    base_vel=[[0.0, 0.0], [0.0, 1.0], [0.0, 0.6]],
+    body_index=1,
+    pos_range=(1.0, 3.0),
+    vel_range=(0.5, 3.0),
+    dt=0.004,
+    eps=0.02,
+)
+
 
 def _accel(pos, m, eps):
-    diff = pos[:, None, :, :] - pos[:, :, None, :]      # (N,n,n,2): diff[k,i,j]=pos_j-pos_i
+    diff = pos[:, None, :, :] - pos[:, :, None, :]
     dist2 = np.sum(diff**2, axis=3) + eps**2
     inv = dist2 ** -1.5
     d = np.arange(pos.shape[1])
@@ -47,27 +65,20 @@ def _energy(pos, vel, m, eps):
     return ke + pe
 
 
-def run_stability_map(masses, base_positions, base_velocities, body_index,
-                      pos_axis, vel_axis, dt, steps, eps,
-                      r_collide=0.06, r_escape=15.0, growth_thresh=1e3):
-    """Scan a grid: Y axis = body_index's initial x-position, X axis = its vy.
+def _min_pair_dist(pos, eps=0.0):
+    diff = pos[:, None, :, :] - pos[:, :, None, :]
+    dist2 = np.sum(diff**2, axis=3)
+    d = np.arange(pos.shape[1])
+    dist2[:, d, d] = np.inf
+    return np.sqrt(dist2.min(axis=(1, 2)) + eps)
 
-    Every grid cell is one simulation (plus a perturbed twin, used only to test
-    for chaos). Returns (dataframe, class_grid, pos_axis, vel_axis).
-    """
-    m = np.asarray(masses, float)
-    n = len(m); M = m.sum()
-    ny, nx = len(pos_axis), len(vel_axis)
-    S = ny * nx
 
-    pos0 = np.tile(np.asarray(base_positions, float), (S, 1, 1))
-    vel0 = np.tile(np.asarray(base_velocities, float), (S, 1, 1))
-    PY, VX = np.meshgrid(pos_axis, vel_axis, indexing="ij")
-    pos0[:, body_index, 0] = PY.ravel()
-    vel0[:, body_index, 1] = VX.ravel()
-
-    # stack the real runs and their perturbed twins into one batch of 2*S
-    pos_p = pos0.copy(); pos_p[:, body_index, 0] += PERT
+def _simulate_and_classify(m, pos0, vel0, dt, steps, eps,
+                           r_collide, r_escape, growth_thresh, pert_index):
+    """Run a batch of initial states (+ twins) and classify each. Returns a dict
+    of per-simulation arrays."""
+    S = pos0.shape[0]; n = pos0.shape[1]; M = m.sum()
+    pos_p = pos0.copy(); pos_p[:, pert_index, 0] += PERT
     pos = np.concatenate([pos0, pos_p], axis=0)
     vel = np.concatenate([vel0, vel0], axis=0)
 
@@ -80,7 +91,7 @@ def run_stability_map(masses, base_positions, base_velocities, body_index,
     d = np.arange(n)
 
     for s in range(steps):
-        p = pos[:S]                                       # diagnostics on the real runs only
+        p = pos[:S]
         diff = p[:, None, :, :] - p[:, :, None, :]
         dist2 = np.sum(diff**2, axis=3)
         max_sep = np.maximum(max_sep, np.sqrt(dist2.max(axis=(1, 2))))
@@ -99,8 +110,7 @@ def run_stability_map(masses, base_positions, base_velocities, body_index,
 
     Ef = _energy(pos, vel, m, eps)[:S]
     e_err = np.abs((Ef - E0) / E0)
-    sep_final = np.sqrt(((pos[:S] - pos[S:])**2).sum(axis=(1, 2)))
-    growth = sep_final / PERT
+    growth = np.sqrt(((pos[:S] - pos[S:])**2).sum(axis=(1, 2))) / PERT
 
     collision = min_pair < r_collide
     escape = (~collision) & (max_com > r_escape)
@@ -114,16 +124,73 @@ def run_stability_map(masses, base_positions, base_velocities, body_index,
     label[chaotic] = "chaotic"
     label[periodic] = "periodic"
 
-    df = pd.DataFrame({
-        "init_position": PY.ravel(),
-        "init_velocity": VX.ravel(),
-        "class": label,
-        "stable": bounded,
-        "escape": escape,
-        "collision": collision,
-        "energy_error": e_err,
-        "max_separation": max_sep,
-        "lifetime": life * dt,
-        "twin_growth": growth,
+    return dict(label=label, stable=bounded, escape=escape, collision=collision,
+                energy_error=e_err, max_separation=max_sep, lifetime=life * dt,
+                twin_growth=growth)
+
+
+def _build_states(scenario, pos_vals, vel_vals):
+    """Construct (S, n, 2) initial position/velocity arrays from paired samples."""
+    m = np.asarray(scenario["masses"], float)
+    bi = scenario["body_index"]
+    S = len(pos_vals)
+    pos0 = np.tile(np.asarray(scenario["base_pos"], float), (S, 1, 1))
+    vel0 = np.tile(np.asarray(scenario["base_vel"], float), (S, 1, 1))
+    pos0[:, bi, 0] = pos_vals
+    vel0[:, bi, 1] = vel_vals
+    return m, pos0, vel0
+
+
+def initial_features(scenario, pos_vals, vel_vals):
+    """Quantities known at t=0 (no simulation). Returns a DataFrame of features."""
+    m, pos0, vel0 = _build_states(scenario, np.asarray(pos_vals, float),
+                                  np.asarray(vel_vals, float))
+    eps = scenario["eps"]
+    e0 = _energy(pos0, vel0, m, eps)
+    lz = np.sum(m[None, :] * (pos0[:, :, 0] * vel0[:, :, 1]
+                              - pos0[:, :, 1] * vel0[:, :, 0]), axis=1)
+    mind = _min_pair_dist(pos0)
+    return pd.DataFrame({
+        "init_position": np.asarray(pos_vals, float),
+        "init_velocity": np.asarray(vel_vals, float),
+        "init_energy": e0,
+        "init_ang_mom": lz,
+        "init_min_dist": mind,
     })
-    return df, label.reshape(ny, nx), pos_axis, vel_axis
+
+
+def run_stability_map(scenario, n_grid, steps,
+                      r_collide=0.06, r_escape=10.0, growth_thresh=1e3):
+    """Grid scan -> (dataframe, class_grid, pos_axis, vel_axis)."""
+    pa = np.linspace(*scenario["pos_range"], n_grid)
+    va = np.linspace(*scenario["vel_range"], n_grid)
+    PY, VX = np.meshgrid(pa, va, indexing="ij")
+    m, pos0, vel0 = _build_states(scenario, PY.ravel(), VX.ravel())
+    out = _simulate_and_classify(m, pos0, vel0, scenario["dt"], steps, scenario["eps"],
+                                 r_collide, r_escape, growth_thresh, scenario["body_index"])
+    df = pd.DataFrame({
+        "init_position": PY.ravel(), "init_velocity": VX.ravel(),
+        "class": out["label"], "stable": out["stable"],
+        "escape": out["escape"], "collision": out["collision"],
+        "energy_error": out["energy_error"], "max_separation": out["max_separation"],
+        "lifetime": out["lifetime"],
+    })
+    return df, out["label"].reshape(n_grid, n_grid), pa, va
+
+
+def run_samples(scenario, n_samples, steps, seed=0,
+                r_collide=0.06, r_escape=10.0, growth_thresh=1e3):
+    """Randomly sampled scan -> a dataset with t=0 features + labels + diagnostics."""
+    rng = np.random.default_rng(seed)
+    pos_vals = rng.uniform(*scenario["pos_range"], n_samples)
+    vel_vals = rng.uniform(*scenario["vel_range"], n_samples)
+    m, pos0, vel0 = _build_states(scenario, pos_vals, vel_vals)
+    out = _simulate_and_classify(m, pos0, vel0, scenario["dt"], steps, scenario["eps"],
+                                 r_collide, r_escape, growth_thresh, scenario["body_index"])
+    feats = initial_features(scenario, pos_vals, vel_vals)
+    feats["class"] = out["label"]
+    feats["stable"] = out["stable"]
+    feats["energy_error"] = out["energy_error"]
+    feats["max_separation"] = out["max_separation"]
+    feats["lifetime"] = out["lifetime"]
+    return feats

@@ -24,7 +24,9 @@ import streamlit.components.v1 as components
 from three_body import (simulate, separation, estimate_lyapunov,
                         energy_series, momentum_series, angular_momentum_series,
                         detect_events, potential_grid)
-from survey import run_stability_map
+from survey import run_stability_map, DEFAULT_SCENARIO
+from classifier import (build_dataset, train_fate_model, predict_grid,
+                        predict_one, CLASSES as FATE_CLASSES)
 
 st.set_page_config(page_title="Three-Body Simulator", layout="wide")
 st.title("Three-Body Gravity Simulator")
@@ -494,13 +496,7 @@ mc_steps = cB.slider("Steps per simulation", 1500, 4000, 2500, step=500)
 
 @st.cache_data(show_spinner=False)
 def _stability(N, steps):
-    masses = [3.0, 1.0, 1.0]
-    base_pos = [[0.0, 0.0], [1.5, 0.0], [5.0, 0.0]]
-    base_vel = [[0.0, 0.0], [0.0, 1.0], [0.0, 0.6]]
-    pa = np.linspace(1.0, 3.0, N)          # Y axis: launch position (x)
-    va = np.linspace(0.5, 3.0, N)          # X axis: launch speed (vy)
-    return run_stability_map(masses, base_pos, base_vel, 1, pa, va,
-                             dt=0.004, steps=steps, eps=0.02)
+    return run_stability_map(DEFAULT_SCENARIO, N, steps)
 
 
 if st.button("Generate stability map", type="primary"):
@@ -546,3 +542,110 @@ if st.button("Generate stability map", type="primary"):
                "system's fate from its starting state - physics generating machine-learning data.")
 else:
     st.info("Choose a resolution and click **Generate stability map**.")
+
+
+# --- Fate predictor (machine learning surrogate) -----------------------------
+st.divider()
+st.header("Predict a system's fate (machine learning)")
+st.markdown(
+    "Train a model to predict the outcome (periodic / chaotic / collision / escape) "
+    "from **only what's known at t=0** - initial position, velocity, energy, angular "
+    "momentum, and closest starting approach. Outcome quantities are deliberately "
+    "excluded (using them would be leakage). The result is a **surrogate model**: it "
+    "predicts a system's fate in microseconds instead of running a full simulation.")
+
+n_samples = st.slider("Training simulations to generate", 500, 3000, 1500, step=250)
+
+FATE_COLORS = {"periodic": "#2E8B57", "chaotic": "#E8A317",
+               "collision": "#C0392B", "escape": "#2E6FB0"}
+
+
+@st.cache_data(show_spinner=False)
+def _train(n, steps):
+    df = build_dataset(n, steps, seed=0)
+    clf, mx = train_fate_model(df, seed=0)
+    return df, clf, mx
+
+
+if st.button("Generate data & train model", type="primary"):
+    st.session_state["fate_trained"] = True
+
+if st.session_state.get("fate_trained"):
+    with st.spinner(f"Simulating {n_samples} systems and training the model..."):
+        ml_df, clf, mx = _train(n_samples, 2800)
+
+    from matplotlib.colors import ListedColormap
+    from matplotlib.patches import Patch
+
+    a, b, c = st.columns(3)
+    a.metric("Test accuracy", f"{100 * mx['accuracy']:.1f}%")
+    b.metric("Training set", f"{mx['n_train']}")
+    c.metric("Test set", f"{mx['n_test']}")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Per-class performance** (test set)")
+        rep = mx["report"]
+        rows = [[cl, f"{rep[cl]['precision']:.2f}", f"{rep[cl]['recall']:.2f}",
+                 f"{rep[cl]['f1-score']:.2f}", int(rep[cl]['support'])]
+                for cl in mx["labels"]]
+        st.table(pd.DataFrame(rows, columns=["class", "precision", "recall",
+                                             "f1", "support"]).set_index("class"))
+        st.markdown("**Feature importance** (what the model relies on)")
+        st.bar_chart(pd.Series(mx["importances"]).sort_values())
+    with right:
+        st.markdown("**Confusion matrix** (rows = true, cols = predicted)")
+        cm = mx["confusion"]; labs = mx["labels"]
+        figc, axc = plt.subplots(figsize=(4.6, 4.2))
+        axc.imshow(cm, cmap="Blues")
+        axc.set_xticks(range(len(labs))); axc.set_xticklabels(labs, rotation=45, ha="right")
+        axc.set_yticks(range(len(labs))); axc.set_yticklabels(labs)
+        for i in range(len(labs)):
+            for j in range(len(labs)):
+                axc.text(j, i, cm[i, j], ha="center", va="center", fontsize=9,
+                         color="white" if cm[i, j] > cm.max() / 2 else "black")
+        axc.set_xlabel("predicted"); axc.set_ylabel("true")
+        figc.tight_layout()
+        st.pyplot(figc)
+
+    st.caption("Initial energy is typically the strongest predictor - the model "
+               "rediscovers that a system's energy largely decides whether it stays bound "
+               "or flies apart. Chaotic is the hard class: it's rare and lives on thin, "
+               "fractal-like boundaries, so its recall is honestly the weakest.")
+
+    # learned fate map vs the true stability map
+    st.markdown("**The model's learned fate map** (predicted across the whole plane)")
+    gridpred, pa, va = predict_grid(clf, 160)
+    code = {cl: i for i, cl in enumerate(FATE_CLASSES)}
+    Zc = np.vectorize(lambda cl: code[cl])(gridpred)
+    cmap = ListedColormap([FATE_COLORS[cl] for cl in FATE_CLASSES])
+    figp, axp = plt.subplots(figsize=(6.5, 5.5))
+    axp.imshow(Zc, origin="lower", aspect="auto",
+               extent=[va[0], va[-1], pa[0], pa[-1]],
+               cmap=cmap, vmin=0, vmax=len(FATE_CLASSES) - 1)
+    axp.set_xlabel("initial velocity (vy)"); axp.set_ylabel("initial position (x)")
+    axp.set_title("Predicted fate (surrogate model)")
+    axp.legend(handles=[Patch(color=FATE_COLORS[cl], label=cl) for cl in FATE_CLASSES],
+               loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=9, frameon=False)
+    figp.tight_layout()
+    st.pyplot(figp)
+    st.caption("Compare this to the true stability map above - the model reconstructs the "
+               "same regions from initial conditions alone, no simulation required.")
+
+    # live surrogate
+    st.markdown("**Try the surrogate** - pick a launch and get an instant prediction:")
+    q1, q2 = st.columns(2)
+    qpos = q1.slider("initial position (x)", float(DEFAULT_SCENARIO["pos_range"][0]),
+                     float(DEFAULT_SCENARIO["pos_range"][1]), 1.5, step=0.01)
+    qvel = q2.slider("initial velocity (vy)", float(DEFAULT_SCENARIO["vel_range"][0]),
+                     float(DEFAULT_SCENARIO["vel_range"][1]), 1.0, step=0.01)
+    lab, proba = predict_one(clf, qpos, qvel)
+    st.metric("Predicted fate", lab)
+    st.bar_chart(pd.Series(proba).sort_values(ascending=False))
+    st.caption("This prediction is instant - no simulation runs. That's the point of a "
+               "surrogate: once trained on simulated data, it replaces the simulation.")
+
+    st.download_button("Download training dataset (CSV)", ml_df.to_csv(index=False),
+                       "fate_dataset.csv", "text/csv")
+else:
+    st.info("Click **Generate data & train model** to build the dataset and train the surrogate.")
